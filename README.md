@@ -33,6 +33,11 @@ docker compose up --build
 * 每节点至多一个父指针：优先取 `In-Reply-To`；没有时取 `References` 的**最后一个**标识。
 * **会话编号 = 根节点的 Message-ID**。
 * 父件缺失时创建占位节点；邮件先到、引用链中间缺失时，按 References 顺序推断中间占位节点的父子关系。
+* **冲突裁决（整批证据，与批内顺序无关）**：同一批中不同邮件的 References 链可能把同一缺件
+  接到不同前驱之后。此时按整批证据投票——**断言某前驱的不同邮件数最多者胜出**（每封邮件对
+  每个候选前驱只计一票）；**平票时取 Message-ID 字典序最小的前驱**。选中的占位父边与批内其他
+  边一样做成环检测（成环则整批 422 拒绝）。该规则只依赖邮件集合本身，因此同一组 EML 任意换序
+  导入，得到的占位父边、修订结果与会话树完全一致（见下文「冲突 References」示例）。
 * 真实邮件到达后若证实占位节点的父边不对，则纠正该边——这会把已存子树挂到新根上，即**会话归并**，
   响应里的 `merged` 返回「旧会话编号 → 新会话编号」映射。
 * 真实已存邮件的内容与父边不可变：同 ID 以不同字节重投会**整批拒绝**。
@@ -46,7 +51,7 @@ docker compose up --build
 | 字段 | 说明 |
 | --- | --- |
 | `mailbox` | 邮箱标识；各邮箱数据与修订号完全独立 |
-| `messages` | 一个或多个原始 EML 文件（可重复字段）。**批次内顺序无关**，最终树相同 |
+| `messages` | 一个或多个原始 EML 文件（可重复字段）。**批次内顺序无关**：同一集合任意换序，占位父边、修订与会话树相同（冲突裁决见下） |
 
 同 `Message-ID` 且**原文字节完全一致**的批次重投：不推进修订，`duplicate=true` 并返回原修订号
 （及当时的归并映射）。整批中任一封出现以下情况都会 **HTTP 422 整批拒绝、不推进修订**：
@@ -54,7 +59,7 @@ docker compose up --build
 * 缺少/无法解析 `Message-ID`（`malformed_eml`）
 * 同 ID 但字节不同（批内或与已存件冲突，`conflicting_content`）
 * 自引用：In-Reply-To 或 References 指向自己（`self_reference`）
-* 与已有节点构成父子环（`cycle`）
+* 与已有节点或批内新边（含裁决选中的占位父边）构成父子环（`cycle`）
 
 #### 例 1：回复先到，父件缺失（创建占位缺件，修订 1）
 
@@ -249,6 +254,216 @@ curl -s -X POST http://localhost:8000/imports -F mailbox=demo -F messages=@bad.e
 }
 ```
 
+### 冲突 References：裁决、换序核对与迟到父件归并
+
+两封邮件的 References 链把同一缺件 `p@example.com` 接到不同前驱之后（`alice` 与 `bob`
+各一票，平票 → 字典序较小的 `alice@example.com` 胜出）：
+
+```bash
+cat > m1.eml <<'EOF'
+Message-ID: <m1@example.com>
+References: <alice@example.com> <p@example.com>
+Subject: Re: Re: Project plan
+
+body
+EOF
+
+cat > m2.eml <<'EOF'
+Message-ID: <m2@example.com>
+References: <bob@example.com> <p@example.com>
+Subject: Re: Re: Project plan
+
+body
+EOF
+
+curl -s -X POST http://localhost:8000/imports \
+  -F mailbox=conflict -F messages=@m1.eml -F messages=@m2.eml
+```
+
+```json
+{
+  "mailbox": "conflict",
+  "revision": 1,
+  "effective": true,
+  "duplicate": false,
+  "merged": {},
+  "imported": 2,
+  "new_messages": 2,
+  "filled_placeholders": 0,
+  "placeholders_created": 3
+}
+```
+
+**换序核对**：同一集合颠倒顺序重投，指纹相同 → 判为重复，返回原修订号 1，不推进修订：
+
+```bash
+curl -s -X POST http://localhost:8000/imports \
+  -F mailbox=conflict -F messages=@m2.eml -F messages=@m1.eml
+```
+
+```json
+{
+  "mailbox": "conflict",
+  "revision": 1,
+  "effective": false,
+  "duplicate": true,
+  "merged": {},
+  "imported": 2
+}
+```
+
+读取会话树核对裁决结果：`p@example.com` 稳定地挂在 `alice@example.com` 之下，
+与上传顺序无关：
+
+```bash
+curl -s "http://localhost:8000/threads?mailbox=conflict"
+```
+
+```json
+{
+  "mailbox": "conflict",
+  "revision": 1,
+  "latest_revision": 1,
+  "threads": [
+    {
+      "thread_id": "alice@example.com",
+      "root_missing": true,
+      "tree": {
+        "message_id": "alice@example.com",
+        "missing": true,
+        "children": [
+          {
+            "message_id": "p@example.com",
+            "missing": true,
+            "children": [
+              {
+                "message_id": "m1@example.com",
+                "missing": false,
+                "children": []
+              },
+              {
+                "message_id": "m2@example.com",
+                "missing": false,
+                "children": []
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "thread_id": "bob@example.com",
+      "root_missing": true,
+      "tree": {
+        "message_id": "bob@example.com",
+        "missing": true,
+        "children": []
+      }
+    }
+  ],
+  "missing": [
+    "alice@example.com",
+    "bob@example.com",
+    "p@example.com"
+  ]
+}
+```
+
+迟到的真实 `p@example.com` 用 `In-Reply-To` 声明真正的父件，推断边被纠正、子树归并，
+`merged` 给出「旧会话编号 → 新会话编号」映射；修订 1 的历史快照保持不变：
+
+```bash
+cat > p.eml <<'EOF'
+Message-ID: <p@example.com>
+In-Reply-To: <thread-root@example.com>
+Subject: Re: Project plan
+
+body
+EOF
+
+curl -s -X POST http://localhost:8000/imports \
+  -F mailbox=conflict -F messages=@p.eml
+```
+
+```json
+{
+  "mailbox": "conflict",
+  "revision": 2,
+  "effective": true,
+  "duplicate": false,
+  "merged": {
+    "alice@example.com": "thread-root@example.com"
+  },
+  "imported": 1,
+  "new_messages": 0,
+  "filled_placeholders": 1,
+  "placeholders_created": 1
+}
+```
+
+```bash
+curl -s "http://localhost:8000/threads?mailbox=conflict"
+```
+
+```json
+{
+  "mailbox": "conflict",
+  "revision": 2,
+  "latest_revision": 2,
+  "threads": [
+    {
+      "thread_id": "alice@example.com",
+      "root_missing": true,
+      "tree": {
+        "message_id": "alice@example.com",
+        "missing": true,
+        "children": []
+      }
+    },
+    {
+      "thread_id": "bob@example.com",
+      "root_missing": true,
+      "tree": {
+        "message_id": "bob@example.com",
+        "missing": true,
+        "children": []
+      }
+    },
+    {
+      "thread_id": "thread-root@example.com",
+      "root_missing": true,
+      "tree": {
+        "message_id": "thread-root@example.com",
+        "missing": true,
+        "children": [
+          {
+            "message_id": "p@example.com",
+            "missing": false,
+            "children": [
+              {
+                "message_id": "m1@example.com",
+                "missing": false,
+                "children": []
+              },
+              {
+                "message_id": "m2@example.com",
+                "missing": false,
+                "children": []
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "missing": [
+    "alice@example.com",
+    "bob@example.com",
+    "thread-root@example.com"
+  ]
+}
+```
+
 ## 并发与原子性
 
 * 每个导入在单事务内完成：解析后先在 Python 中校验，再在数据库中以
@@ -295,7 +510,7 @@ DATABASE_URL=postgresql://mails:mails@localhost:5432/mails \
 app/
   schema.sql    PostgreSQL 表结构（mailboxes / nodes / revisions / link_events）
   eml.py        标准库 email 解析 Message-ID / In-Reply-To / References（CFWS 注释/折行）
-  importer.py   批次校验、事务、占位、归并、成环检测、修订与历史重建
+  importer.py   批次校验、事务、占位、References 冲突裁决、归并、成环检测、修订与历史重建
   db.py         连接池与建表
   main.py       FastAPI 路由
 tests/          基于真实 PostgreSQL 的集成测试

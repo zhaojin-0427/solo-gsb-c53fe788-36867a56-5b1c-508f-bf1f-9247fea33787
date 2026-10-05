@@ -60,6 +60,31 @@ def main() -> None:
             r = post("demo", eml("bad@example.com", in_reply_to="bad@example.com"))
             print("### SELF REF (422) ###")
             print(r.status_code); print(json.dumps(r.json(), indent=2))
+
+            # --- conflicting References, order-independence demo ---
+            m1 = eml("m1@example.com",
+                     references=["alice@example.com", "p@example.com"],
+                     subject="Re: Re: Project plan")
+            m2 = eml("m2@example.com",
+                     references=["bob@example.com", "p@example.com"],
+                     subject="Re: Re: Project plan")
+            r = post("conflict", m1, m2)
+            print("### CONFLICT import [m1, m2] ###"); print(pretty(r))
+
+            r = post("conflict", m2, m1)  # same set, reversed order
+            print("### CONFLICT re-import reversed (duplicate) ###")
+            print(pretty(r))
+
+            r = client.get("/threads", params={"mailbox": "conflict"})
+            print("### CONFLICT threads ###"); print(pretty(r))
+
+            r = post("conflict", eml("p@example.com",
+                                     in_reply_to="thread-root@example.com",
+                                     subject="Re: Project plan"))
+            print("### CONFLICT late parent of p ###"); print(pretty(r))
+
+            r = client.get("/threads", params={"mailbox": "conflict"})
+            print("### CONFLICT threads after merge ###"); print(pretty(r))
     finally:
         server.cleanup()
         shutil.rmtree(data_dir, ignore_errors=True)

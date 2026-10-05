@@ -94,6 +94,40 @@ def parse_batch(raw_items: list[bytes]) -> dict[str, Item]:
     return items
 
 
+def _infer_placeholder_parents(items: dict[str, Item]) -> dict[str, str]:
+    """Pick one inferred parent per referenced id from whole-batch evidence.
+
+    Adjacent ids in a ``References`` chain (with the message's own id as the
+    chain tail) assert "pred is child's parent".  Different messages in the
+    batch can attach the same not-yet-seen id to different predecessors, so
+    the claims are adjudicated deterministically:
+
+    1. the candidate asserted by the largest number of *distinct* messages
+       wins -- each message casts at most one vote per candidate, no matter
+       how often its chain repeats the pair;
+    2. ties go to the lexicographically smallest predecessor id.
+
+    The rule only reads the batch as a set, so the inferred edges -- and
+    therefore the revision events and the reconstructed conversation trees
+    -- are identical for any upload order of the same EML set.  The chosen
+    edges are cycle-checked together with every other edge of the batch.
+    """
+    votes: dict[str, dict[str, set[str]]] = {}
+    for it in items.values():
+        parsed = it.parsed
+        chain = list(parsed.references) + [parsed.msg_id]
+        asserted: set[tuple[str, str]] = set()
+        for child, pred in zip(chain[1:], chain[:-1]):
+            if (child, pred) in asserted:
+                continue  # one vote per message per distinct claim
+            asserted.add((child, pred))
+            votes.setdefault(child, {}).setdefault(pred, set()).add(parsed.msg_id)
+    return {
+        child: min(candidates, key=lambda pred: (-len(candidates[pred]), pred))
+        for child, candidates in votes.items()
+    }
+
+
 def _fingerprint(mailbox_id: int, items: dict[str, Item]) -> bytes:
     h = hashlib.sha256()
     h.update(mailbox_id.to_bytes(8, "big"))
@@ -143,22 +177,21 @@ def import_batch(conn, mailbox_name: str, raw_items: list[bytes]) -> dict:
         }
 
     referenced = set(items)
-    inferred_preds: dict[str, str] = {}
     for it in items.values():
         p = it.parsed
         referenced.update(p.references)
         if p.parent_id:
             referenced.add(p.parent_id)
-        # reference order supplies ancestry for not-yet-seen intermediates
-        chain = list(p.references) + [p.msg_id]
-        for child, pred in zip(chain[1:], chain[:-1]):
-            inferred_preds.setdefault(child, pred)
+    # reference order supplies ancestry for not-yet-seen intermediates;
+    # conflicting claims are adjudicated by a deterministic whole-batch rule
+    inferred_preds = _infer_placeholder_parents(items)
 
     rows = _load_rows(conn, mailbox_id, referenced)
 
     plan = _build_plan(items, rows, inferred_preds)
 
-    # cycles against the stored forest plus every edge set by this batch
+    # cycles against the stored forest plus every edge set by this batch,
+    # including the adjudicated placeholder edges chosen above
     for v, u in plan.events.items():
         if _creates_cycle(conn, mailbox_id, v, u, plan.events):
             raise BatchRejected("rejected", [{
@@ -172,14 +205,15 @@ def import_batch(conn, mailbox_name: str, raw_items: list[bytes]) -> dict:
     # subtree root changes because an edge of this batch moved it (typical
     # case: a late parent attaches an existing placeholder subtree).
     merged: dict[str, str] = {}
-    for v in plan.preexisting:
+    for v in sorted(plan.preexisting):
         if v not in plan.events:
             continue
         old_root = _db_root(conn, mailbox_id, v)
         new_root = _new_root(conn, mailbox_id, v, plan.events)
         if old_root != new_root and old_root not in merged:
-            # keep the first mapping per old root; moved siblings belonging
-            # to one subtree resolve to the same new root
+            # keep the first mapping per old root (smallest msg_id wins, so
+            # the result is deterministic); moved siblings belonging to one
+            # subtree resolve to the same new root
             merged[old_root] = new_root
 
     latest = conn.execute(

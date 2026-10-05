@@ -237,6 +237,143 @@ def test_mailboxes_are_independent(client):
     assert [c["message_id"] for c in roots(t2)["p2@x"]["tree"]["children"]] == ["shared@x"]
 
 
+# --------------------------------------------- conflicting references ------
+
+def _conflicting_batch() -> list[bytes]:
+    # m1 attaches the missing p@x after a@x; m2 attaches it after b@x
+    return [
+        eml("m1@x", references=["a@x", "p@x"]),
+        eml("m2@x", references=["b@x", "p@x"]),
+    ]
+
+
+def test_conflicting_references_tie_breaks_lexicographically(client):
+    # 1-1 tie between a@x and b@x: the smallest predecessor id wins
+    r = import_(client, "mb", *_conflicting_batch())
+    assert r.status_code == 200
+    t = client.get("/threads", params={"mailbox": "mb"}).json()
+    assert set(roots(t)) == {"a@x", "b@x"}
+    a = roots(t)["a@x"]["tree"]
+    assert [c["message_id"] for c in a["children"]] == ["p@x"]
+    p = a["children"][0]
+    assert p["missing"] is True
+    assert sorted(c["message_id"] for c in p["children"]) == ["m1@x", "m2@x"]
+    assert roots(t)["b@x"]["tree"]["children"] == []
+
+
+def test_conflicting_references_batch_order_irrelevant(client):
+    msgs = _conflicting_batch()
+    r1 = import_(client, "one", *msgs)
+    r2 = import_(client, "two", *reversed(msgs))
+    assert r1.status_code == r2.status_code == 200
+    t1 = client.get("/threads", params={"mailbox": "one"}).json()
+    t2 = client.get("/threads", params={"mailbox": "two"}).json()
+    assert t1["threads"] == t2["threads"]
+    assert t1["missing"] == t2["missing"]
+
+
+def test_conflicting_references_majority_wins_over_lexicographic(client):
+    # two messages attach p@x after z@x, one after a@x: the majority claim
+    # (z@x) wins even though a@x is lexicographically smaller
+    msgs = [
+        eml("m1@x", references=["z@x", "p@x"]),
+        eml("m2@x", references=["z@x", "p@x"]),
+        eml("m3@x", references=["a@x", "p@x"]),
+    ]
+    import_(client, "one", *msgs)
+    import_(client, "two", *reversed(msgs))
+    t1 = client.get("/threads", params={"mailbox": "one"}).json()
+    t2 = client.get("/threads", params={"mailbox": "two"}).json()
+    assert t1["threads"] == t2["threads"]
+    z = roots(t1)["z@x"]["tree"]
+    assert [c["message_id"] for c in z["children"]] == ["p@x"]
+    assert roots(t1)["a@x"]["tree"]["children"] == []
+
+
+def test_conflicting_batch_reimported_reordered_is_duplicate(client):
+    msgs = _conflicting_batch()
+    first = import_(client, "mb", *msgs).json()
+    again = import_(client, "mb", *reversed(msgs)).json()
+    assert again["duplicate"] is True
+    assert again["effective"] is False
+    assert again["revision"] == first["revision"]
+
+
+def test_conflicting_inferred_edges_forming_cycle_rejected(client):
+    # m1 attaches p@x after a@x while m2 attaches a@x after p@x: the selected
+    # inferred edges would form a cycle -> whole batch 422, no revision
+    fwd = [eml("m1@x", references=["a@x", "p@x"]),
+           eml("m2@x", references=["p@x", "a@x"])]
+    for i, batch in enumerate((fwd, list(reversed(fwd)))):
+        r = import_(client, f"mb{i}", *batch)
+        assert r.status_code == 422
+        assert any(d["code"] == "cycle" for d in r.json()["error"]["details"])
+        assert client.get("/threads", params={"mailbox": f"mb{i}"}).status_code == 404
+
+
+def test_late_parent_corrects_adjudicated_edge_and_merges(client):
+    msgs = _conflicting_batch()  # p@x inferred under a@x in both orders
+    import_(client, "one", *msgs)
+    import_(client, "two", *reversed(msgs))
+
+    # the real p@x arrives late and declares a different genuine parent
+    late = eml("p@x", in_reply_to="root@x")
+    m1 = import_(client, "one", late).json()
+    m2 = import_(client, "two", late).json()
+    assert m1["merged"] == {"a@x": "root@x"}
+    assert m1["merged"] == m2["merged"]
+
+    t1 = client.get("/threads", params={"mailbox": "one"}).json()
+    t2 = client.get("/threads", params={"mailbox": "two"}).json()
+    assert t1["threads"] == t2["threads"]
+    root = roots(t1)["root@x"]["tree"]
+    p = root["children"][0]
+    assert p["message_id"] == "p@x"
+    assert p["missing"] is False
+    assert sorted(c["message_id"] for c in p["children"]) == ["m1@x", "m2@x"]
+
+    # the revision-1 snapshot is not rewritten by the merge and is identical
+    # across upload orders
+    h1 = client.get("/threads", params={"mailbox": "one", "revision": 1}).json()
+    h2 = client.get("/threads", params={"mailbox": "two", "revision": 1}).json()
+    assert h1["threads"] == h2["threads"]
+    a = roots(h1)["a@x"]["tree"]
+    assert [c["message_id"] for c in a["children"]] == ["p@x"]
+    assert a["children"][0]["missing"] is True
+
+
+def test_conflicting_batch_all_permutations_give_same_tree(client):
+    import itertools
+
+    msgs = [
+        eml("m1@x", references=["a@x", "p@x"]),
+        eml("m2@x", references=["b@x", "p@x"]),
+        eml("m3@x", references=["a@x", "p@x"]),
+        eml("m4@x", in_reply_to="p@x"),
+    ]
+    trees = []
+    for i, perm in enumerate(itertools.permutations(msgs)):
+        r = import_(client, f"perm{i}", *perm)
+        assert r.status_code == 200
+        assert r.json()["revision"] == 1
+        trees.append(client.get("/threads",
+                                params={"mailbox": f"perm{i}"}).json())
+    for t in trees[1:]:
+        assert t["threads"] == trees[0]["threads"]
+        assert t["missing"] == trees[0]["missing"]
+    # majority 2-1 (plus an In-Reply-To child): p@x sits under a@x
+    a = roots(trees[0])["a@x"]["tree"]
+    assert [c["message_id"] for c in a["children"]] == ["p@x"]
+
+
+def test_repeated_reference_id_self_loop_rejected_as_cycle(client):
+    # degenerate chain <p@x> <p@x> would infer p@x as its own parent
+    r = import_(client, "mb", eml("m@x", references=["p@x", "p@x"]))
+    assert r.status_code == 422
+    assert any(d["code"] == "cycle" for d in r.json()["error"]["details"])
+    assert client.get("/threads", params={"mailbox": "mb"}).status_code == 404
+
+
 # ------------------------------------------------------------- validation --
 
 def test_missing_message_id_rejects_whole_batch(client):
