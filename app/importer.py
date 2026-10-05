@@ -106,6 +106,40 @@ def _fingerprint(mailbox_id: int, items: dict[str, Item]) -> bytes:
     return h.digest()
 
 
+def _adjudicate_inferred(items: dict[str, Item]) -> dict[str, str]:
+    """Guess the parent of every missing id mentioned *inside* References.
+
+    Each adjacent ``(pred, child)`` pair in a message's References chain is
+    evidence that ``child``'s parent is ``pred`` (RFC 5322: newest last). A
+    missing node can be attested under several different predecessors by
+    different messages of the same batch; keeping the first one seen would
+    make the placeholder tree depend on upload order. Instead every pair in
+    the whole batch is collected first, and conflicts are adjudicated by:
+
+    1. the predecessor attested by the most *distinct* messages (majority
+       evidence wins);
+    2. ties broken by the lexicographically smallest predecessor id.
+
+    The result is therefore a pure function of the set of EMLs in the batch.
+    Only placeholders receive guessed edges -- genuine messages always take
+    their own In-Reply-To / last References parent -- and every guessed edge
+    goes through the same cycle check as a genuine edge before being written.
+    """
+    votes: dict[str, dict[str, set[str]]] = {}
+    for msg_id, it in items.items():
+        refs = it.parsed.references
+        for pred, child in zip(refs, refs[1:]):
+            if pred == child:
+                # repeated id carries no ancestry information
+                continue
+            votes.setdefault(child, {}).setdefault(pred, set()).add(msg_id)
+
+    return {
+        child: min(candidates, key=lambda pred: (-len(candidates[pred]), pred))
+        for child, candidates in votes.items()
+    }
+
+
 # --------------------------------------------------------------------------
 # Transaction
 # --------------------------------------------------------------------------
@@ -143,23 +177,23 @@ def import_batch(conn, mailbox_name: str, raw_items: list[bytes]) -> dict:
         }
 
     referenced = set(items)
-    inferred_preds: dict[str, str] = {}
     for it in items.values():
         p = it.parsed
         referenced.update(p.references)
         if p.parent_id:
             referenced.add(p.parent_id)
-        # reference order supplies ancestry for not-yet-seen intermediates
-        chain = list(p.references) + [p.msg_id]
-        for child, pred in zip(chain[1:], chain[:-1]):
-            inferred_preds.setdefault(child, pred)
+    # ancestry guesses for missing intermediates, arbitrated over the *whole*
+    # batch so that reordering the upload cannot change the resulting tree
+    inferred_preds = _adjudicate_inferred(items)
 
     rows = _load_rows(conn, mailbox_id, referenced)
 
     plan = _build_plan(items, rows, inferred_preds)
 
-    # cycles against the stored forest plus every edge set by this batch
-    for v, u in plan.events.items():
+    # cycles against the stored forest plus every edge set by this batch;
+    # sorted iteration keeps the reported offender independent of upload order
+    for v in sorted(plan.events):
+        u = plan.events[v]
         if _creates_cycle(conn, mailbox_id, v, u, plan.events):
             raise BatchRejected("rejected", [{
                 "index": items[v].index if v in items else None,
@@ -171,8 +205,10 @@ def import_batch(conn, mailbox_name: str, raw_items: list[bytes]) -> dict:
     # Old/new thread-number mapping. A merge happens when a pre-existing
     # subtree root changes because an edge of this batch moved it (typical
     # case: a late parent attaches an existing placeholder subtree).
+    # Nodes are visited in sorted order so that two moved siblings sharing an
+    # old root are mapped deterministically (they resolve to one new root).
     merged: dict[str, str] = {}
-    for v in plan.preexisting:
+    for v in sorted(plan.preexisting):
         if v not in plan.events:
             continue
         old_root = _db_root(conn, mailbox_id, v)
@@ -284,7 +320,9 @@ def _build_plan(
     for ref in sorted(referenced_all):
         if ref in items or ref in rows:
             continue
-        pred = inferred_preds.get(ref)  # may be None: ancestry unknown
+        # batch-adjudicated predecessor (see _adjudicate_inferred); None when
+        # the batch offers no adjacency evidence, i.e. the placeholder is root
+        pred = inferred_preds.get(ref)
         plan.inserts_placeholder.append((ref, pred))
         plan.events[ref] = pred  # recorded even when NULL (node creation)
 

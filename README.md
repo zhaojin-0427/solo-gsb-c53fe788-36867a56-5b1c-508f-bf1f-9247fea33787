@@ -32,7 +32,16 @@ docker compose up --build
   要么是**占位缺件**。
 * 每节点至多一个父指针：优先取 `In-Reply-To`；没有时取 `References` 的**最后一个**标识。
 * **会话编号 = 根节点的 Message-ID**。
-* 父件缺失时创建占位节点；邮件先到、引用链中间缺失时，按 References 顺序推断中间占位节点的父子关系。
+* 父件缺失时创建占位节点；邮件先到、引用链中间缺失时，按 References 相邻标识推断中间占位节点的父子关系。
+* **冲突 References 的稳定裁决**：同一缺件 `p` 可能被批内多封邮件接在不同前驱之后
+  （一封的 References 是 `…,a,p,…`，另一封是 `…,b,p,…`）。这种情况下父边**不依赖上传顺序**，
+  而由整批证据裁决：
+  1. 统计批内**不同邮件**投给各候选前驱的票数（每封邮件对同一 `(前驱, 缺件)` 对至多计一票），
+     **得票最多的前驱胜出**；
+  2. 票数相同则取 **Message-ID 字典序最小**的前驱。
+  推断只用于占位节点；真实邮件始终以自身 `In-Reply-To`（否则末个 References）为准。
+  选中的推断父边与真实边一样先**查环**，成环则整批拒绝。因此同一批 EML 无论怎么排列，
+  占位父边、修订结果与重建出的会话树都完全一致。
 * 真实邮件到达后若证实占位节点的父边不对，则纠正该边——这会把已存子树挂到新根上，即**会话归并**，
   响应里的 `merged` 返回「旧会话编号 → 新会话编号」映射。
 * 真实已存邮件的内容与父边不可变：同 ID 以不同字节重投会**整批拒绝**。
@@ -136,6 +145,156 @@ curl -s -X POST http://localhost:8000/imports \
     "ghost@example.com": "thread-root@example.com"
   },
   "imported": 1
+}
+```
+
+#### 例 4：冲突 References 稳定裁决（批内顺序无关）
+
+缺件 `p@example.com` 被三封邮件提及：`m1`、`m3` 的 References 把它接在 `a@example.com`
+之后（两票），`m2` 接在 `b@example.com` 之后（一票）。无论上传顺序如何，多数证据胜出，
+`p` 稳定挂到 `a` 下：
+
+```bash
+cat > m1.eml <<'EOF'
+Message-ID: <m1@example.com>
+References: <a@example.com> <p@example.com>
+Subject: witness one
+
+body
+EOF
+cat > m2.eml <<'EOF'
+Message-ID: <m2@example.com>
+References: <b@example.com> <p@example.com>
+Subject: witness two
+
+body
+EOF
+cat > m3.eml <<'EOF'
+Message-ID: <m3@example.com>
+References: <a@example.com> <p@example.com>
+Subject: another vote for a
+
+body
+EOF
+
+# 顺序 A
+curl -s -X POST http://localhost:8000/imports \
+  -F mailbox=conflict -F messages=@m1.eml -F messages=@m2.eml -F messages=@m3.eml
+# 顺序 B（倒序，换一个邮箱对比）
+curl -s -X POST http://localhost:8000/imports \
+  -F mailbox=conflict-rev -F messages=@m3.eml -F messages=@m2.eml -F messages=@m1.eml
+```
+
+两种顺序返回完全相同的修订结果：
+
+```json
+{
+  "mailbox": "conflict",
+  "revision": 1,
+  "effective": true,
+  "duplicate": false,
+  "merged": {},
+  "imported": 3,
+  "new_messages": 3,
+  "filled_placeholders": 0,
+  "placeholders_created": 3
+}
+```
+
+核对会话树（`GET /threads?mailbox=conflict`；`conflict-rev` 邮箱逐字节相同）：
+
+```json
+{
+  "mailbox": "conflict",
+  "revision": 1,
+  "latest_revision": 1,
+  "threads": [
+    {
+      "thread_id": "a@example.com",
+      "root_missing": true,
+      "tree": {
+        "message_id": "a@example.com",
+        "missing": true,
+        "children": [
+          {
+            "message_id": "p@example.com",
+            "missing": true,
+            "children": [
+              {"message_id": "m1@example.com", "missing": false, "children": []},
+              {"message_id": "m2@example.com", "missing": false, "children": []},
+              {"message_id": "m3@example.com", "missing": false, "children": []}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "thread_id": "b@example.com",
+      "root_missing": true,
+      "tree": {"message_id": "b@example.com", "missing": true, "children": []}
+    }
+  ],
+  "missing": ["a@example.com", "b@example.com", "p@example.com"]
+}
+```
+
+三封真实邮件的父指针都取自身末个 References（即 `p`），所以它们都是 `p` 的子节点；
+落选的 `b` 成为独立的空占位根。若只有 `m1`、`m2`（1:1 平票），则按字典序取
+`a@example.com`，与谁先上传无关。
+
+迟到的真实 `p` 随后声明父件为 `q`，推断边被纠正并归并，旧快照不变：
+
+```bash
+printf 'Message-ID: <p@example.com>\nIn-Reply-To: <q@example.com>\n\nbody\n' > p.eml
+curl -s -X POST http://localhost:8000/imports -F mailbox=conflict -F messages=@p.eml
+```
+
+```json
+{
+  "mailbox": "conflict",
+  "revision": 2,
+  "effective": true,
+  "duplicate": false,
+  "merged": {
+    "a@example.com": "q@example.com"
+  },
+  "imported": 1,
+  "new_messages": 0,
+  "filled_placeholders": 1,
+  "placeholders_created": 1
+}
+```
+
+此时 `GET /threads?mailbox=conflict` 有三个根（空根 `a`、空根 `b`、缺件根 `q`），
+`p` 连同 m1/m2/m3 挂在 `q` 下；而 `GET /threads?mailbox=conflict&revision=1`
+仍是上面那张 `a -> p -> …` 的旧树。
+
+#### 例 5：推断边成环仍整批拒绝（与顺序无关）
+
+三条 References 让三个占位缺件互相指向（`g→x→p→g`），环在占位边上就被检出，
+正序倒序都返回同一个 422 且不推进修订：
+
+```bash
+printf 'Message-ID: <u1@example.com>\nReferences: <x@example.com> <g@example.com>\n\nx\n' > u1.eml
+printf 'Message-ID: <u2@example.com>\nReferences: <g@example.com> <p@example.com>\n\nx\n' > u2.eml
+printf 'Message-ID: <u3@example.com>\nReferences: <p@example.com> <x@example.com>\n\nx\n' > u3.eml
+curl -s -X POST http://localhost:8000/imports \
+  -F mailbox=cyc -F messages=@u1.eml -F messages=@u2.eml -F messages=@u3.eml
+```
+
+```json
+{
+  "error": {
+    "code": "rejected",
+    "details": [
+      {
+        "index": null,
+        "code": "cycle",
+        "message_id": "g@example.com",
+        "message": "batch would create a parent cycle"
+      }
+    ]
+  }
 }
 ```
 
@@ -253,7 +412,9 @@ curl -s -X POST http://localhost:8000/imports -F mailbox=demo -F messages=@bad.e
 
 * 每个导入在单事务内完成：解析后先在 Python 中校验，再在数据库中以
   `pg_advisory_xact_lock(邮箱)` 串行化同邮箱写入；不同邮箱互不阻塞。
-* 成环检测覆盖「库内已存深链 + 本批新边」的组合（沿父边用递归 CTE 追溯）。
+* 占位父边在写入前先汇总**整批** References 证据并按「票数优先、字典序兜底」裁决，
+  再与真实边一起逐边查环；因此批次内上传顺序不改变占位父边、`merged` 映射与会话树。
+* 成环检测覆盖「库内已存深链 + 本批新边（含推断占位边）」的组合（沿父边用递归 CTE 追溯）。
 * 修订历史为只追加表 `link_events`：每次边的建立/纠正记一条事件，读取修订 N 时取每个节点
   `rev <= N` 的最近事件重建森林；历史修订永不 UPDATE。
 

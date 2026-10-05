@@ -228,6 +228,111 @@ def test_reorder_batch_gives_same_tree(client):
     assert t1["threads"] == t2["threads"]
 
 
+# --------------------------------- conflicting References adjudication ------
+
+def _placeholders_tree(t: dict, msg_id: str) -> tuple[str, list[str]]:
+    """Return (thread_id, child ids) of the placeholder node's position."""
+    def walk(node):
+        if node["message_id"] == msg_id:
+            return node
+        for ch in node["children"]:
+            found = walk(ch)
+            if found is not None:
+                return found
+        return None
+
+    for th in t["threads"]:
+        node = walk(th["tree"])
+        if node is not None:
+            return th["thread_id"], [c["message_id"] for c in node["children"]]
+    raise AssertionError(f"{msg_id} not found")
+
+
+def test_conflicting_inferred_parents_resolved_order_independently(client):
+    # Two messages attest different predecessors for the same missing p@x:
+    # a 1:1 evidence tie must break to the lexicographically smallest id,
+    # regardless of which message is uploaded first.
+    m_a = eml("m1@x", references=["a@x", "p@x"])
+    m_b = eml("m2@x", references=["b@x", "p@x"])
+
+    r1 = import_(client, "one", m_a, m_b)
+    r2 = import_(client, "two", m_b, m_a)
+    assert r1.status_code == r2.status_code == 200
+    body1, body2 = r1.json(), r2.json()
+    assert body1["revision"] == body2["revision"] == 1
+    assert body1["placeholders_created"] == body2["placeholders_created"] == 3
+
+    t1 = client.get("/threads", params={"mailbox": "one"}).json()
+    t2 = client.get("/threads", params={"mailbox": "two"}).json()
+    assert t1["threads"] == t2["threads"]
+    # p@x stably hangs under a@x (smallest tie-break id); both mails reply to p
+    assert _placeholders_tree(t1, "p@x") == ("a@x", ["m1@x", "m2@x"])
+    assert sorted(t1["missing"]) == ["a@x", "b@x", "p@x"]
+    # b@x lost the adjudication and remains a separate (empty) placeholder root
+    assert "b@x" in roots(t1)
+
+
+def test_inferred_parent_majority_evidence_wins(client):
+    # two messages place p@x under a@x, only one under b@x: majority wins
+    m1 = eml("m1@x", references=["a@x", "p@x"])
+    m3 = eml("m3@x", references=["a@x", "p@x"])
+    m2 = eml("m2@x", references=["b@x", "p@x"])
+
+    import_(client, "one", m1, m3, m2)
+    import_(client, "two", m2, m3, m1)
+    t1 = client.get("/threads", params={"mailbox": "one"}).json()
+    t2 = client.get("/threads", params={"mailbox": "two"}).json()
+    assert t1["threads"] == t2["threads"]
+    root, kids = _placeholders_tree(t1, "p@x")
+    assert root == "a@x"
+    assert sorted(kids) == ["m1@x", "m2@x", "m3@x"]
+
+
+def test_conflicting_inferred_edge_corrected_by_late_parent(client):
+    # p@x is stably guessed under a@x (tie-break); the real p@x says q@x:
+    # the inferred edge is corrected and the subtree merges, history intact.
+    import_(client, "mb",
+            eml("m1@x", references=["a@x", "p@x"]),
+            eml("m2@x", references=["b@x", "p@x"]))
+    before = client.get("/threads", params={"mailbox": "mb"}).json()
+    assert _placeholders_tree(before, "p@x")[0] == "a@x"
+
+    r = import_(client, "mb", eml("p@x", in_reply_to="q@x"))
+    assert r.status_code == 200
+    # a@x's subtree (p -> m1,m2) moves under q@x; a@x and b@x remain empty roots
+    assert r.json()["merged"] == {"a@x": "q@x"}
+
+    latest = client.get("/threads", params={"mailbox": "mb"}).json()
+    assert set(roots(latest)) == {"a@x", "b@x", "q@x"}
+    q = roots(latest)["q@x"]["tree"]
+    p = q["children"][0]
+    assert p["message_id"] == "p@x"
+    assert sorted(c["message_id"] for c in p["children"]) == ["m1@x", "m2@x"]
+
+    # the revision-1 snapshot is not rewritten by the correction
+    rev1 = client.get("/threads", params={"mailbox": "mb", "revision": 1}).json()
+    assert rev1["threads"] == before["threads"]
+
+
+def test_conflicting_inferred_edges_forming_cycle_reject_batch(client):
+    # three guessed placeholder edges close a ring (a -> x -> p -> a);
+    # the whole batch must be rejected in either upload order
+    msgs = [
+        eml("u1@x", references=["x@x", "a@x"]),   # guessed a -> x
+        eml("u2@x", references=["a@x", "p@x"]),   # guessed p -> a
+        eml("u3@x", references=["p@x", "x@x"]),   # guessed x -> p => ring
+    ]
+
+    r1 = import_(client, "one", *msgs)
+    r2 = import_(client, "two", *reversed(msgs))
+    assert r1.status_code == r2.status_code == 422
+    assert any(d["code"] == "cycle" for d in r1.json()["error"]["details"])
+    assert any(d["code"] == "cycle" for d in r2.json()["error"]["details"])
+    # nothing was imported, no revision exists
+    assert client.get("/threads", params={"mailbox": "one"}).status_code == 404
+    assert client.get("/threads", params={"mailbox": "two"}).status_code == 404
+
+
 def test_mailboxes_are_independent(client):
     import_(client, "mb1", eml("shared@x", in_reply_to="p1@x"))
     import_(client, "mb2", eml("shared@x", in_reply_to="p2@x"))
